@@ -1201,16 +1201,30 @@ async def get_usage_logs(days: int = 1, _=Depends(verify_admin)):
             "duration": dur,
             "tps": tps,
             "status": r.get("status", "ok"),
-            "routing_score": round(get_quality_score(f"{r.get('provider', '')}||{r.get('model', '')}") * 100, 1),
+            "routing_score": round(_effective_score(f"{r.get('provider', '')}||{r.get('model', '')}") * 100, 1),
         })
     return {"days": days, "total": len(logs), "logs": logs}
 
 
 @app.get("/api/quality-scores")
 async def get_quality_scores(_=Depends(verify_admin)):
-    """返回所有模型的路由质量分（滑动窗口），前端可与 UI 统计分对比"""
+    """返回模型的路由分：路由组中的模型用综合分（含延迟惩罚和随机偏移），其余用基础质量分"""
+    # 收集路由组中出现的所有模型名
+    router_model_names = set()
+    for models in ROUTERS.values():
+        router_model_names.update(models)
     keys = list(model_quality.keys())
-    return {key: round(get_quality_score(key) * 100, 1) for key in sorted(keys)}
+    result = {}
+    for key in sorted(keys):
+        if "||" in key:
+            model_name = key.split("||", 1)[1]
+        else:
+            model_name = key
+        if model_name in router_model_names:
+            result[key] = round(_effective_score(key) * 100, 1)
+        else:
+            result[key] = round(get_quality_score(key) * 100, 1)
+    return result
 
 
 @app.get("/api/model-details")

@@ -31,6 +31,7 @@ test_sensenova*.json
 
 # AI 工作记录（内部使用，不公开）
 DEVLOG.md
+路由设计文档.md
 
 # 日志
 *.log
