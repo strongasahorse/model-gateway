@@ -52,7 +52,7 @@ META_FILE = DATA_DIR / "models_meta.json"
 ROUTERS_FILE = DATA_DIR / "routers.json"
 ANNOUNCEMENT_FILE = DATA_DIR / "announcement.json"
 
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 
 MAX_HISTORY_DAYS = 30
 MAX_USAGE_DAYS = 30
@@ -239,6 +239,7 @@ model_session_count: dict = {}    # key -> 本轮对话中的调用次数
 model_last_called: dict = {}      # key -> 最后一次成功调用的时间
 _last_random_boosts: dict = {}    # key -> 当前轮次的随机偏移（-5%~+5%）
 _last_boost_time: float = 0       # 上次生成随机偏移的时间
+_last_daily_poll_date: int = 0    # 上次执行每日轮询的日期（tm_yday）
 providers_lock = asyncio.Lock()
 history_lock = asyncio.Lock()
 usage_lock = asyncio.Lock()
@@ -679,7 +680,7 @@ async def run_health_checks(tasks: list[tuple[str, str, str, str]]) -> dict:
 
 
 async def poll_all():
-    global health_status, last_poll_time, last_check_time
+    global health_status, last_poll_time, last_check_time, _last_daily_poll_date
     # 首次拉取 model details
     for p in list(providers):
         try:
@@ -708,6 +709,28 @@ async def poll_all():
                         pass
         except Exception:
             pass
+
+    # 首次进入 while 循环前，先执行每日全量轮询，确保启动后立即检测
+    _now = time.localtime()
+    _ws = app_config.get("poll_work_start", 7)
+    _we = app_config.get("poll_work_end", 21)
+    if _ws <= _now.tm_hour < _we and _last_daily_poll_date == 0:
+        _last_daily_poll_date = _now.tm_yday
+        logger.info("启动后立即执行每日全量轮询")
+        _daily_tasks = []
+        for p in list(providers):
+            for m in get_enabled_models(p):
+                _daily_tasks.append((p["name"], m, p["base_url"], p["api_key"]))
+        try:
+            _ns = await run_health_checks(_daily_tasks)
+            health_status = _ns
+            last_poll_time = time.time()
+            last_check_time = last_poll_time
+            await append_history(_ns)
+            ok_count = sum(1 for v in _ns.values() if v.get("status") == "ok")
+            logger.info("daily poll done: %d/%d ok", ok_count, len(_ns))
+        except Exception:
+            logger.exception("startup daily poll error")
 
     while True:
         now = time.localtime()
@@ -759,6 +782,31 @@ async def poll_all():
             except Exception:
                 logger.exception("new model first poll failed")
 
+        # 每天执行一次全量轮询（所有模型，不计入上限），确保每天至少一次检测
+        if _last_daily_poll_date != now.tm_yday:
+            _last_daily_poll_date = now.tm_yday
+            # 先标记就绪，避免 UI 等待全量轮询完成才显示"⭕️ 就绪"
+            if last_poll_time == 0:
+                last_poll_time = time.time()
+            logger.info("执行每日一次全量轮询")
+            daily_tasks = []
+            for p in list(providers):
+                for m in get_enabled_models(p):
+                    daily_tasks.append((p["name"], m, p["base_url"], p["api_key"]))
+            try:
+                new_status = await run_health_checks(daily_tasks)
+                health_status = new_status
+                last_poll_time = time.time()
+                last_check_time = last_poll_time
+                await append_history(new_status)
+                await maybe_cleanup_history()
+                ok_count = sum(1 for v in new_status.values() if v.get("status") == "ok")
+                logger.info("daily poll done: %d/%d ok", ok_count, len(new_status))
+            except Exception:
+                logger.exception("daily poll error")
+            # 每日轮询后继续执行后续的逻辑（不会跳过正常轮询）
+
+
         # 构建本次要轮询的模型列表（只选未达到上限的）
         tasks = []
         for p in list(providers):
@@ -767,22 +815,45 @@ async def poll_all():
                 if model_poll_count.get(key, 0) < daily_limit:
                     tasks.append((p["name"], m, p["base_url"], p["api_key"]))
 
-        # 如果所有模型都已达到上限，改为每天 12:00 检测一次
+        # 如果所有模型都已达到上限，改为每天工作开始时检测一次
         if not tasks:
             # 标记轮询已初始化，避免 UI 卡在"初始化中…"
             if last_poll_time == 0:
                 last_poll_time = time.time()
-            noon_today = time.mktime((
-                now.tm_year, now.tm_mon, now.tm_mday,
-                12, 0, 0, now.tm_wday, now.tm_yday, now.tm_isdst
-            ))
-            if time.time() < noon_today:
-                wait_seconds = noon_today - time.time()
-            else:
-                wait_seconds = noon_today + 86400 - time.time()
-            logger.info("所有模型轮询已达 %d 次上限，改为每天 12:00 检测一次", daily_limit)
-            while time.time() < max(time.time() + wait_seconds, last_check_time + interval):
-                await asyncio.sleep(30)
+            # 如果今日已执行过每日轮询，等明天 work_start
+            if _last_daily_poll_date == now.tm_yday:
+                next_day = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, work_start, 0, 0, 0, 0, -1)) + 86400
+                wait_seconds = next_day - time.time()
+                while time.time() < max(time.time() + wait_seconds, last_check_time + interval):
+                    await asyncio.sleep(30)
+                continue
+            # 今日尚未执行每日轮询：等 work_start 或立即执行
+            daily_time = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, work_start, 0, 0, 0, 0, -1))
+            if time.time() < daily_time:
+                wait_seconds = daily_time - time.time()
+                logger.info("所有模型轮询已达 %d 次上限，等待到 %d:00 执行每日轮询", daily_limit, work_start)
+                while time.time() < max(time.time() + wait_seconds, last_check_time + interval):
+                    await asyncio.sleep(30)
+            # 执行每日一次轮询（所有模型，不计上限）
+            logger.info("执行每日一次轮询")
+            daily_tasks = []
+            for p in list(providers):
+                for m in get_enabled_models(p):
+                    daily_tasks.append((p["name"], m, p["base_url"], p["api_key"]))
+            try:
+                new_status = await run_health_checks(daily_tasks)
+                health_status = new_status
+                last_poll_time = time.time()
+                last_check_time = last_poll_time
+                # 每日轮询不累计到 model_poll_count（不触发上限再次生效）
+                await append_history(new_status)
+                await maybe_cleanup_history()
+                ok_count = sum(1 for v in new_status.values() if v.get("status") == "ok")
+                logger.info("daily poll done: %d/%d ok", ok_count, len(new_status))
+            except Exception:
+                logger.exception("daily poll error")
+            # 标记今日已执行每日轮询
+            _last_daily_poll_date = now.tm_yday
             continue
 
         try:
@@ -1782,8 +1853,8 @@ PRESET_CACHE_TTL = 300
 
 # 内置兜底预设（断网保底；平台变更时改远端 presets.json 热更新即可，无需重新打包）
 BUILTIN_PRESET = {
-    "version": "2026-07-20",
-    "updated_at": "2026-07-20",
+    "version": "2026-07-27",
+    "updated_at": "2026-07-27",
     "doc_url": PRESET_DOC_URL,
     "platforms": {
         "NVIDIA": {
