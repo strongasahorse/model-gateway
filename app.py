@@ -1383,11 +1383,46 @@ async def vision_models_api(_=Depends(verify_admin)):
     return {"ok": True, "data": sorted(SUPPORTS_VISION.keys())}
 
 
-# ---------- 系统公告（Gitee 远程，本地兜底） ----------
-DEFAULT_ANNOUNCEMENT_URL = "https://gitee.com/ywtc000/dongye/raw/master/announcement.md"
-ANNOUNCEMENT_CACHE_FILE = DATA_DIR / "announcement_cache.json"
-_announcement_cache = {"content": None, "ts": 0}
-ANNOUNCEMENT_TTL = 300
+# ---------- 系统公告（内置） ----------
+BUILTIN_ANNOUNCEMENT = """# 📢 系统公告
+
+## ✨ 最新版本 v1.6.2
+
+**自定义端口、API Key 三模式、智能轮询、路由质量分、调用日志等多项增强。**
+
+### 自定义端口
+- `config.json` 中 `port` 字段自定义端口，不再硬编码 8000
+
+### API Key 三模式
+- **安全模式**：删除 `local_api_key` 字段，重启自动生成随机 Key
+- **开放模式**：设为空字符串，任意 API Key 均可通信
+- **自定义 Key**：填入你的密钥，必须匹配才能通信
+
+### 智能轮询
+- 每小时检测一次，非工作时间不检测
+- 累计检测超过 20 次后降为每天工作开始时一次
+- 按模型独立计数，新加模型不受影响
+- 新增模型首次自动轮询
+
+### 路由质量分
+- 综合分 = 质量分 - 延迟惩罚 + 随机偏移
+- 延迟惩罚：超过 1 秒每 1 秒扣 2%，最多扣 0.3 分
+- 随机偏移：连续使用 10 次以上 + 闲置 5 分钟触发一次（-5%~+5%）
+- 质量分相同时以延迟作为第二排序条件
+
+### 调用日志
+- 记录每次调用（成功/失败），显示路由分、耗时、TPS
+- 失败以 ❌ 标记
+- 数据保留 30 天自动清理
+
+### UI 优化
+- 路由面板两列布局 + 筛选 + 路由分显示
+- ⭕️ 就绪提示、非工作时间状态提示
+- 识图配置勾选修复
+
+### 其他
+- `start.bat` 启动脚本，自动创建虚拟环境
+- 控制台压制 httpx 噪音，保留有用日志"""
 
 
 def _content_hash(content: str) -> str:
@@ -1401,44 +1436,8 @@ def _announce_response(ok: bool, content: str) -> dict:
 
 @app.get("/api/announcement")
 async def get_announcement(_=Depends(verify_admin)):
-    """优先读 config.json 的 announcement_url（如 Gitee raw 链接）远程抓取；
-    未配置或抓取失败时回退到本地 announcement.json。远程结果缓存 5 分钟。"""
-    cfg = load_config()
-    url = cfg.get("announcement_url") or DEFAULT_ANNOUNCEMENT_URL
-    now = time.time()
-    if _announcement_cache["content"] is not None and now - _announcement_cache["ts"] < ANNOUNCEMENT_TTL:
-        return _announce_response(True, _announcement_cache["content"])
-    # 远程抓取
-    try:
-        resp = await http_client.get(url, timeout=10, follow_redirects=True)
-        if resp.status_code == 200 and resp.text.strip():
-            content = resp.text
-            _announcement_cache["content"] = content
-            _announcement_cache["ts"] = now
-            # 持久化到本地缓存文件，断网时回退显示上次成功的内容
-            try:
-                atomic_write(ANNOUNCEMENT_CACHE_FILE, json.dumps({"content": content, "ts": now}, ensure_ascii=False))
-            except Exception:
-                logger.warning("write announcement cache file failed")
-            return _announce_response(True, content)
-    except Exception:
-        logger.warning("fetch remote announcement failed: %s", url)
-    # 远程失败：读本地缓存文件（上次成功抓取的内容）
-    if ANNOUNCEMENT_CACHE_FILE.exists():
-        try:
-            data = json.loads(ANNOUNCEMENT_CACHE_FILE.read_text(encoding="utf-8"))
-            if data.get("content"):
-                return _announce_response(True, data["content"])
-        except Exception:
-            pass
-    # 最终兜底：默认 announcement.json
-    if ANNOUNCEMENT_FILE.exists():
-        try:
-            data = json.loads(ANNOUNCEMENT_FILE.read_text(encoding="utf-8"))
-            return _announce_response(True, data.get("content", ""))
-        except Exception:
-            logger.exception("parse announcement.json failed")
-    return _announce_response(False, "暂无公告内容。")
+    """返回内置公告内容，不再从远程获取"""
+    return _announce_response(True, BUILTIN_ANNOUNCEMENT)
 
 
 # ---------- 在线更新 ----------
