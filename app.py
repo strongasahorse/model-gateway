@@ -710,10 +710,24 @@ async def poll_all():
         except Exception:
             pass
 
-    # 首次进入 while 循环前，先执行每日全量轮询，确保启动后立即检测
+    # 首次进入 while 循环前，检查今天是否已有全量轮询记录
     _now = time.localtime()
     _ws = app_config.get("poll_work_start", 7)
     _we = app_config.get("poll_work_end", 21)
+    _today_tm = time.mktime((_now.tm_year, _now.tm_mon, _now.tm_mday, 0, 0, 0, 0, 0, -1))
+    if HISTORY_FILE.exists():
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as _f:
+                for _line in _f:
+                    try:
+                        _rec = json.loads(_line.strip())
+                        if _rec.get("time", 0) >= _today_tm:
+                            _last_daily_poll_date = _now.tm_yday
+                            break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     if _ws <= _now.tm_hour < _we and _last_daily_poll_date == 0:
         _last_daily_poll_date = _now.tm_yday
         logger.info("启动后立即执行每日全量轮询")
