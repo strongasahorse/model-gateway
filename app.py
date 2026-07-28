@@ -52,7 +52,7 @@ META_FILE = DATA_DIR / "models_meta.json"
 ROUTERS_FILE = DATA_DIR / "routers.json"
 ANNOUNCEMENT_FILE = DATA_DIR / "announcement.json"
 
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.7.0"
 
 MAX_HISTORY_DAYS = 30
 MAX_USAGE_DAYS = 30
@@ -1090,6 +1090,36 @@ def compress_hermes(obj: dict) -> dict:
     return json.loads(s)
 
 
+def compress_lite(body: dict) -> tuple[dict, int, int]:
+    """Lite 压缩：去除多余空白、缩短 system prompt、压缩 JSON key。
+    返回 (compressed_body, original_chars, compressed_chars)。"""
+    original_total = 0
+    compressed_total = 0
+    msgs = body.get("messages", [])
+    for msg in msgs:
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            continue
+        original_total += len(content)
+        # 压缩：连续空白 → 单个空格，多余换行 → 单个换行
+        c = content
+        c = re.sub(r"[ \t]+", " ", c)
+        c = re.sub(r"\n{3,}", "\n\n", c)
+        c = re.sub(r"^[ \t]+|[ \t]+$", "", c, flags=re.MULTILINE)
+        # system 消息：去除每行首尾空白
+        if msg.get("role") == "system":
+            c = re.sub(r"^[ \t]+", "", c, flags=re.MULTILINE)
+            c = re.sub(r"[ \t]+$", "", c, flags=re.MULTILINE)
+            c = re.sub(r"\n{2,}", "\n", c)
+        compressed_total += len(c)
+        msg["content"] = c
+    # 如果 messages 数组中有 tool_calls / function_call 等 JSON，压缩冗余空白
+    s = json.dumps(msgs, ensure_ascii=False)
+    # 还原到 body 中
+    body["messages"] = json.loads(s)
+    return body, original_total, compressed_total
+
+
 def restore_hermes_text(text: str) -> str:
     for long, short in HERMES_MAP:
         text = text.replace(short, long)
@@ -1230,7 +1260,7 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
 async def get_usage(days: int = 1, _=Depends(verify_admin)):
     days = max(1, min(days, MAX_USAGE_DAYS))
     records = await read_usage(days)
-    total = {"pt": 0, "ct": 0, "tt": 0, "requests": 0}
+    total = {"pt": 0, "ct": 0, "tt": 0, "requests": 0, "input_token_saved": 0}
     by_day = {}
     by_model = {}
     for r in records:
@@ -1239,22 +1269,26 @@ async def get_usage(days: int = 1, _=Depends(verify_admin)):
         pt = r.get("pt", 0) or 0
         ct = r.get("ct", 0) or 0
         tt = r.get("tt", 0) or (pt + ct)
+        its = r.get("input_token_saved", 0) or 0
         m = r.get("model", "unknown")
         p = r.get("provider", "unknown")
         total["pt"] += pt
         total["ct"] += ct
         total["tt"] += tt
+        total["input_token_saved"] += its
         total["requests"] += 1
-        d = by_day.setdefault(day, {"pt": 0, "ct": 0, "tt": 0, "requests": 0})
+        d = by_day.setdefault(day, {"pt": 0, "ct": 0, "tt": 0, "requests": 0, "input_token_saved": 0})
         d["pt"] += pt
         d["ct"] += ct
         d["tt"] += tt
+        d["input_token_saved"] += its
         d["requests"] += 1
         mk = f"{p} · {m}"
-        mm = by_model.setdefault(mk, {"pt": 0, "ct": 0, "tt": 0, "requests": 0, "provider": p, "model": m})
+        mm = by_model.setdefault(mk, {"pt": 0, "ct": 0, "tt": 0, "requests": 0, "input_token_saved": 0, "provider": p, "model": m})
         mm["pt"] += pt
         mm["ct"] += ct
         mm["tt"] += tt
+        mm["input_token_saved"] += its
         mm["requests"] += 1
     by_day_list = [{"date": d, **v} for d, v in sorted(by_day.items())]
     by_model_list = [
@@ -1287,6 +1321,8 @@ async def get_usage_logs(days: int = 1, _=Depends(verify_admin)):
             "tps": tps,
             "status": r.get("status", "ok"),
             "routing_score": round(_effective_score(f"{r.get('provider', '')}||{r.get('model', '')}") * 100, 1),
+            "input_token_saved": r.get("input_token_saved", 0),
+            "input_token_saved_pct": r.get("input_token_saved_pct", 0),
         })
     return {"days": days, "total": len(logs), "logs": logs}
 
@@ -1400,9 +1436,16 @@ async def vision_models_api(_=Depends(verify_admin)):
 # ---------- 系统公告（内置） ----------
 BUILTIN_ANNOUNCEMENT = """# 📢 系统公告
 
-## ✨ 最新版本 v1.6.2
+## ✨ 最新版本 v1.7.0
 
-**自定义端口、API Key 三模式、智能轮询、路由质量分、调用日志等多项增强。**
+**Lite 压缩、调用日志优化、消耗统计增强等多项改进。**
+
+### Lite 压缩
+- 自动去除输入消息中的多余空白、连续换行
+- 缩短 system prompt 中的冗余内容
+- 在不影响语义的前提下减少 token 消耗
+- 调用日志中显示每次请求节约的 token 数和比例
+- 消耗统计中汇总展示总节约 token 和节约比例
 
 ### 自定义端口
 - `config.json` 中 `port` 字段自定义端口，不再硬编码 8000
@@ -1425,7 +1468,7 @@ BUILTIN_ANNOUNCEMENT = """# 📢 系统公告
 - 质量分相同时以延迟作为第二排序条件
 
 ### 调用日志
-- 记录每次调用（成功/失败），显示路由分、耗时、TPS
+- 记录每次调用（成功/失败），显示路由分、耗时、TPS、节约 Token、节约比例
 - 失败以 ❌ 标记
 - 数据保留 30 天自动清理
 
@@ -2022,7 +2065,7 @@ def _inject_cn_hint(body: dict):
 # ============================================================
 # 代理（客户端鉴权）
 # ============================================================
-async def _stream_with_failover(candidates, body, is_router, prelude: str = "", start_time: float = 0):
+async def _stream_with_failover(candidates, body, is_router, prelude: str = "", start_time: float = 0, input_saved: int = 0, input_orig_chars: int = 0):
     """流式转发，中断时自动切换下一个候选模型继续输出。prelude 为先输出给用户的提示文本。"""
 
     async def gen():
@@ -2123,6 +2166,8 @@ async def _stream_with_failover(candidates, body, is_router, prelude: str = "", 
                             "pt": pt, "ct": ct, "tt": tt,
                             "duration": round(dur, 2),
                             "tps": round(ct / dur, 2) if dur > 0 and ct > 0 else 0,
+                            "input_token_saved": input_saved,
+                            "input_token_saved_pct": round(input_saved / input_orig_chars * 100, 1) if input_orig_chars else 0,
                         })
                     except Exception:
                         logger.exception("append_usage(stream) failed")
@@ -2154,6 +2199,9 @@ async def proxy_chat(request: Request, force: bool = False):
     body = await request.json()
     body = compress_hermes(body)
     body = ensure_lang_reply(body)
+    # Lite 压缩：去除多余空白、缩短 system prompt
+    body, _input_orig_chars, _input_comp_chars = compress_lite(body)
+    _input_saved = _input_orig_chars - _input_comp_chars
     requested_model = body.get("model")
 
     # 识图辅助：含图片且目标非识图组/识图模型 → 直接转交识图路由组
@@ -2184,7 +2232,7 @@ async def proxy_chat(request: Request, force: bool = False):
     last_err = None
 
     if stream:
-        return await _stream_with_failover(candidates, body, is_router, prelude=vision_prelude, start_time=_start_time)
+        return await _stream_with_failover(candidates, body, is_router, prelude=vision_prelude, start_time=_start_time, input_saved=_input_saved, input_orig_chars=_input_orig_chars)
 
     for attempt in (2,) if is_router else (1,):
         for provider, model in candidates:
@@ -2218,12 +2266,15 @@ async def proxy_chat(request: Request, force: bool = False):
                         ct = u.get("completion_tokens", 0) or 0
                         tt = pt + ct
                         dur = time.time() - _start_time if '_start_time' in dir() else 0
+                        _saved_pct = round(_input_saved / _input_orig_chars * 100, 1) if _input_orig_chars else 0
                         await append_usage({
                             "ts": time.time(), "model": model,
                             "provider": provider["name"],
                             "pt": pt, "ct": ct, "tt": tt,
                             "duration": round(dur, 2),
                             "tps": round(ct / dur, 2) if dur > 0 and ct > 0 else 0,
+                            "input_token_saved": _input_saved,
+                            "input_token_saved_pct": _saved_pct,
                         })
                     except Exception:
                         logger.exception("append_usage(non-stream) failed")

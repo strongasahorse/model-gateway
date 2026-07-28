@@ -786,12 +786,14 @@ input:checked + .slider:before { transform: translateX(14px); }
             <th width="80">输入Token</th>
             <th width="80">输出Token</th>
             <th width="80">合计Token</th>
+            <th width="80">节约Token</th>
+            <th width="60">节约%</th>
             <th width="100">耗时(秒)</th>
             <th width="90">TPS</th>
           </tr>
         </thead>
         <tbody id="logBody">
-          <tr><td colspan="8" class="empty">加载中...</td></tr>
+          <tr><td colspan="11" class="empty">加载中...</td></tr>
         </tbody>
       </table>
     </div>
@@ -1221,10 +1223,13 @@ function fmtNum(n) {
 }
 function renderUsage(data) {
   const t = data.total || {};
+  const savedPct = t.pt > 0 ? (t.input_token_saved / t.pt * 100).toFixed(1) : 0;
   const cards = [
     { label: '输入 Token', value: t.pt },
     { label: '输出 Token', value: t.ct },
     { label: '合计 Token', value: t.tt },
+    { label: '节约 Token', value: t.input_token_saved || 0 },
+    { label: '节约比例', value: savedPct + '%' },
     { label: '请求数', value: t.requests },
   ];
   document.getElementById('usageOverview').innerHTML = cards.map(c =>
@@ -1708,6 +1713,8 @@ function renderLogs(data) {
       <td>${isFail ? '--' : r.pt}</td>
       <td>${isFail ? '--' : r.ct}</td>
       <td>${isFail ? '--' : r.tt}</td>
+      <td>${isFail ? '--' : (r.input_token_saved || '0')}</td>
+      <td>${isFail ? '--' : (r.input_token_saved_pct || '0') + '%'}</td>
       <td>${dur}</td>
       <td>${tps}</td>
     </tr>`;
