@@ -704,9 +704,11 @@ input:checked + .slider:before { transform: translateX(14px); }
       <select id="stabilityHours" onchange="loadStability()">
         <option value="1">最近 1 小时</option>
         <option value="6">最近 6 小时</option>
-        <option value="24" selected>最近 24 小时</option>
+        <option value="24">最近 24 小时</option>
         <option value="72">最近 3 天</option>
         <option value="168">最近 7 天</option>
+        <option value="720">最近 30 天</option>
+        <option value="-20" selected>最近 20 次</option>
       </select>
       <select id="stableFilter" onchange="renderStability()">
         <option value="all">全部可用性状态</option>
@@ -731,6 +733,7 @@ input:checked + .slider:before { transform: translateX(14px); }
             <th>成功 / 失败</th>
             <th>平均延迟</th>
             <th>极速 / 最慢</th>
+            <th width="60">操作</th>
           </tr>
         </thead>
         <tbody id="stableBody"></tbody>
@@ -1188,9 +1191,15 @@ async function load() {
 }
 
 async function loadStability() {
-  const hours = document.getElementById('stabilityHours').value;
+  const val = document.getElementById('stabilityHours').value;
+  let url;
+  if (val.startsWith('-')) {
+    url = `/api/stability?last_n=${Math.abs(Number(val))}`;
+  } else {
+    url = `/api/stability?hours=${val}`;
+  }
   try {
-    const r = await apiFetch(`/api/stability?hours=${hours}`);
+    const r = await apiFetch(url);
     stabilityData = await r.json();
     renderStability();
   } catch (e) {
@@ -1229,13 +1238,13 @@ function renderUsage(data) {
     { label: '输出 Token', value: t.ct },
     { label: '合计 Token', value: t.tt },
     { label: '节约 Token', value: t.input_token_saved || 0 },
-    { label: '节约比例', value: savedPct + '%' },
+    { label: '节约比例', value: savedPct, unit: '%' },
     { label: '请求数', value: t.requests },
   ];
   document.getElementById('usageOverview').innerHTML = cards.map(c =>
     `<div class="provider-card" style="padding: 14px 16px;">
        <div style="font-size: 12px; color: var(--text-secondary);">${c.label}</div>
-       <div style="font-size: 22px; font-weight: 600; color: var(--text-primary); margin-top: 4px;">${fmtNum(c.value)}</div>
+       <div style="font-size: 22px; font-weight: 600; color: var(--text-primary); margin-top: 4px;">${fmtNum(c.value)}${c.unit ? '<span style="font-size:14px;margin-left:2px;">' + c.unit + '</span>' : ''}</div>
      </div>`
   ).join('');
   const rows = data.by_model || [];
@@ -1271,7 +1280,7 @@ function renderStability() {
 
   const tbody = document.getElementById('stableBody');
   if (!filtered.length) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty">No records found in this timeframe.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">No records found in this timeframe.</td></tr>';
     return;
   }
 
@@ -1325,6 +1334,7 @@ function renderStability() {
         <span style="color:var(--text-secondary);margin:0 4px">~</span>
         <span style="color:var(--text-secondary)">${maxL}</span>
       </td>
+      <td><button class="btn" style="padding:2px 6px;font-size:11px;" onclick="checkModel('${d.provider}','${d.model}')">检测</button></td>
     </tr>`;
   }).join('');
 }
@@ -1347,6 +1357,18 @@ async function checkAll() {
     btn.disabled = false;
     load();
   }
+}
+
+async function checkModel(provider, model) {
+  try {
+    const r = await apiFetch(`/api/check/${provider}/${model}`, { method: 'POST' });
+    const result = await r.json();
+    if (result && result.status === 'ok') showToast(`检测完成：${provider} · ${model} 正常`, 'ok');
+    else showToast(`检测完成：${provider} · ${model} 异常`, 'warn');
+  } catch (e) {
+    if (e.message !== 'Unauthorized') { console.error("Check failed", e); showToast("检测请求失败", "error"); }
+  }
+  load();
 }
 
 async function updatePollStatus() {
@@ -1732,6 +1754,7 @@ let routersData = {};
 let allModelOptions = [];   // [{provider, model}]
 let currentRouterName = null; // 当前选中的路由组名
 let routingQualityScores = {}; // 路由质量分缓存 {provider||model: score}
+let priorityScores = {};        // 优先分配置 {router: {key: score}}
 
 async function loadVisionAssist() {
   try {
@@ -1790,6 +1813,11 @@ async function openRouterManager() {
     const r = await apiFetch('/api/quality-scores');
     routingQualityScores = await r.json();
   } catch (e) { routingQualityScores = {}; }
+  // 4. 拉取优先分
+  try {
+    const r = await apiFetch('/api/priority-scores');
+    priorityScores = await r.json();
+  } catch (e) { priorityScores = {}; }
   renderRouterList();
   if (Object.keys(routersData).length > 0) {
     selectRouterGroup(Object.keys(routersData)[0]);
@@ -1907,6 +1935,11 @@ function renderRouterModels() {
         <span style="color:${dotColor};font-size:11px;margin-left:4px;font-weight:500;">${pct}%</span>
         <span style="color:var(--text-secondary);font-size:10px;margin-left:2px;">${lat}</span>
         <span style="color:var(--accent-primary);font-size:10px;margin-left:2px;font-weight:500;">${(routingQualityScores[opt.provider+'||'+opt.model] || '--') + '%'}</span>
+        <span style="color:var(--success);font-size:10px;margin-left:2px;">${(priorityScores[currentRouterName]?.[opt.provider+'||'+opt.model] ? (priorityScores[currentRouterName][opt.provider+'||'+opt.model] > 0 ? '+' : '') + (priorityScores[currentRouterName][opt.provider+'||'+opt.model] * 100).toFixed(1) + '%' : '')}</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:1px;margin-left:4px;flex-shrink:0;">
+        <button style="padding:0 4px;height:12px;line-height:10px;font-size:10px;border:1px solid var(--mac-border);border-radius:3px 3px 1px 1px;background:transparent;color:var(--success);cursor:pointer;" onclick="event.preventDefault();adjustPriority('${currentRouterName}','${opt.provider}','${opt.model}',0.05)" title="优先积分 +5%">+</button>
+        <button style="padding:0 4px;height:12px;line-height:10px;font-size:10px;border:1px solid var(--mac-border);border-radius:1px 1px 3px 3px;background:transparent;color:var(--danger);cursor:pointer;" onclick="event.preventDefault();adjustPriority('${currentRouterName}','${opt.provider}','${opt.model}',-0.05)" title="优先积分 -5%">−</button>
       </div>
     </label>`;
   }).join('');
@@ -2009,6 +2042,32 @@ async function saveRouters() {
     if (r.ok) showToast('路由配置已保存', 'ok');
     else { showToast('保存失败', 'error'); }
   } catch (e) { if (e.message !== 'Unauthorized') { console.error(e); showToast('保存请求错误', 'error'); } }
+}
+
+async function adjustPriority(router, provider, model, delta) {
+  const key = provider + '||' + model;
+  try {
+    const r = await apiFetch('/api/priority-scores', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ router, key, delta })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      if (!priorityScores[router]) priorityScores[router] = {};
+      if (Math.abs(d.priority) < 0.001) {
+        delete priorityScores[router][key];
+      } else {
+        priorityScores[router][key] = d.priority;
+      }
+      renderRouterModels();
+      showToast('优先分已调整：' + (delta > 0 ? '+' : '') + (delta * 100).toFixed(0) + '%', 'ok');
+    } else {
+      showToast('调整失败', 'error');
+    }
+  } catch (e) {
+    if (e.message !== 'Unauthorized') { console.error(e); showToast('请求失败', 'error'); }
+  }
 }
 
 let _visionModelSet = new Set();

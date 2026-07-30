@@ -52,7 +52,7 @@ META_FILE = DATA_DIR / "models_meta.json"
 ROUTERS_FILE = DATA_DIR / "routers.json"
 ANNOUNCEMENT_FILE = DATA_DIR / "announcement.json"
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 
 MAX_HISTORY_DAYS = 30
 MAX_USAGE_DAYS = 30
@@ -106,6 +106,7 @@ def load_config():
         cfg.setdefault("poll_work_start", 7)
         cfg.setdefault("poll_work_end", 21)
         cfg.setdefault("poll_daily_limit", 20)
+        cfg.setdefault("priority_scores", {})
         # 三种模式：
         # ① local_api_key 字段不存在 → 自动生成随机 Key（安全模式）
         # ② local_api_key 为空字符串 "" → 开放模式（任意 Key 放行）
@@ -124,6 +125,7 @@ def load_config():
         "poll_work_start": 7,
         "poll_work_end": 21,
         "poll_daily_limit": 20,
+        "priority_scores": {},
     }
     atomic_write(CONFIG_FILE, json.dumps(data, ensure_ascii=False, indent=2))
     return data
@@ -288,6 +290,35 @@ def _read_history_sync(hours: int):
 async def read_history(hours: int = 24):
     async with history_lock:
         return await asyncio.to_thread(_read_history_sync, hours)
+
+
+async def read_history_last_n(n: int = 20):
+    """读取历史记录中最后 n 条记录"""
+    if not HISTORY_FILE.exists():
+        return []
+    async with history_lock:
+        return await asyncio.to_thread(_read_history_last_n_sync, n)
+
+
+def _read_history_last_n_sync(n: int) -> list:
+    """同步读取最后 n 条历史记录"""
+    if not HISTORY_FILE.exists():
+        return []
+    lines = []
+    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                lines.append(line)
+            except Exception:
+                pass
+    records = []
+    for line in lines[-n:]:
+        try:
+            rec = json.loads(line.strip())
+            records.append(rec)
+        except Exception:
+            pass
+    return records
 
 
 def _cleanup_history_sync():
@@ -710,18 +741,18 @@ async def poll_all():
         except Exception:
             pass
 
-    # 首次进入 while 循环前，检查今天是否已有全量轮询记录
+    # 首次进入 while 循环前，检查今天是否已经执行过全量轮询（扫描全部记录，避免被单条请求记录干扰）
     _now = time.localtime()
     _ws = app_config.get("poll_work_start", 7)
     _we = app_config.get("poll_work_end", 21)
-    _today_tm = time.mktime((_now.tm_year, _now.tm_mon, _now.tm_mday, 0, 0, 0, 0, 0, -1))
     if HISTORY_FILE.exists():
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as _f:
                 for _line in _f:
                     try:
                         _rec = json.loads(_line.strip())
-                        if _rec.get("time", 0) >= _today_tm:
+                        _keys = list(_rec.get("data", {}).keys())
+                        if _rec.get("time", 0) >= time.mktime((_now.tm_year, _now.tm_mon, _now.tm_mday, 0, 0, 0, 0, 0, -1)) and len(_keys) > 3:
                             _last_daily_poll_date = _now.tm_yday
                             break
                     except Exception:
@@ -984,15 +1015,19 @@ class PresetApplyIn(BaseModel):
 # ============================================================
 # 模型选择
 # ============================================================
-def _effective_score(key: str) -> float:
-    """路由综合分 = 质量分 - 延迟惩罚 + 随机偏移"""
+def _effective_score(key: str, router: str = "") -> float:
+    """路由综合分 = 质量分 - 延迟惩罚 + 随机偏移 + 优先分"""
     base = get_quality_score(key)
     # 延迟惩罚：超过1秒的部分每1秒扣2%，最多扣0.3分（lat 单位：毫秒→秒）
     lat = (get_avg_latency(key) or 0) / 1000
     penalty = min(round(max(0, lat - 1) * 0.02, 4), 0.3)
     boost = _last_random_boosts.get(key, 0)
-    result = base - penalty + boost
-    logger.info("ROUTE %s: base=%.2f penalty=%.2f boost=%.2f result=%.2f", key, base, penalty, boost, result)
+    # 优先分（按路由组 + provider||model）
+    priority = 0
+    if router:
+        priority = float((app_config.get("priority_scores", {}) or {}).get(router, {}).get(key, 0))
+    result = base - penalty + boost + priority
+    logger.info("ROUTE %s: base=%.2f penalty=%.2f boost=%.2f priority=%.2f result=%.2f", key, base, penalty, boost, priority, result)
     return result
 
 
@@ -1033,7 +1068,7 @@ def pick_available_models(model: str | None = None, force: bool = False) -> list
         if not raw:
             raw = unhealthy_raw
         scored = [
-            (_effective_score(k), get_avg_latency(k) or 1e9, p, m)
+            (_effective_score(k, model), get_avg_latency(k) or 1e9, p, m)
             for p, m, k in raw
         ]
         scored.sort(key=lambda x: (-x[0], x[1]))
@@ -1203,18 +1238,35 @@ STABILITY_CACHE_TTL = 30
 
 
 @app.get("/api/stability")
-async def get_stability(hours: int = 24, _=Depends(verify_admin)):
+async def get_stability(hours: int = 24, last_n: int = 0, _=Depends(verify_admin)):
     now = time.time()
-    cached = _stability_cache.get(hours)
+    cached = _stability_cache.get((hours, last_n))
     if cached and now - cached[0] < STABILITY_CACHE_TTL:
         return cached[1]
-    records = await read_history(hours)
-    model_stats: dict = {}
-    for rec in records:
-        for key, info in rec.get("data", {}).items():
-            if key not in model_stats:
-                model_stats[key] = {"ok": 0, "fail": 0, "error": 0, "total": 0, "latencies": []}
-            model_stats[key]["total"] += 1
+    if last_n > 0:
+        # 从 model_quality 滑动窗口读取最近 N 次，与路由分窗口一致
+        model_stats: dict = {}
+        for key, q in model_quality.items():
+            sw = list(q.get("status_window", []))
+            lats = list(q.get("latencies", []))
+            total = len(sw)
+            if total == 0:
+                continue
+            ok_count = sum(1 for s in sw if s == "ok")
+            fail_count = sum(1 for s in sw if s == "fail")
+            err_count = sum(1 for s in sw if s == "error")
+            model_stats[key] = {
+                "ok": ok_count, "fail": fail_count, "error": err_count,
+                "total": total, "latencies": lats,
+            }
+    else:
+        records = await read_history(hours)
+        model_stats: dict = {}
+        for rec in records:
+            for key, info in rec.get("data", {}).items():
+                if key not in model_stats:
+                    model_stats[key] = {"ok": 0, "fail": 0, "error": 0, "total": 0, "latencies": []}
+                model_stats[key]["total"] += 1
             st = info.get("status", "unknown")
             if st == "ok":
                 model_stats[key]["ok"] += 1
@@ -1252,7 +1304,7 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
             "vision": is_vision_model(model),
         })
     result.sort(key=lambda x: (-x["availability"], x["avg_latency_ms"] or 99999))
-    _stability_cache[hours] = (now, result)
+    _stability_cache[(hours, last_n)] = (now, result)
     return result
 
 
@@ -1296,6 +1348,32 @@ async def get_usage(days: int = 1, _=Depends(verify_admin)):
         for _, v in sorted(by_model.items(), key=lambda x: -x[1]["tt"])
     ]
     return {"days": days, "total": total, "by_day": by_day_list, "by_model": by_model_list}
+
+
+@app.get("/api/priority-scores")
+async def get_priority_scores(_=Depends(verify_admin)):
+    """返回所有路由组的优先分配置"""
+    return app_config.get("priority_scores", {}) or {}
+
+
+@app.post("/api/priority-scores")
+async def set_priority_score(data: dict, _=Depends(verify_admin)):
+    """调整单个模型的优先分：{router, key, delta}，delta 为 0.05 或 -0.05"""
+    router = data.get("router", "")
+    key = data.get("key", "")
+    delta = float(data.get("delta", 0))
+    if not router or not key:
+        return {"ok": False, "error": "missing router or key"}
+    ps = app_config.setdefault("priority_scores", {})
+    rp = ps.setdefault(router, {})
+    current = rp.get(key, 0.0)
+    new_val = round(current + delta, 2)
+    if abs(new_val) < 0.001:
+        rp.pop(key, None)
+    else:
+        rp[key] = new_val
+    save_config()
+    return {"ok": True, "priority": new_val}
 
 
 @app.get("/api/usage-logs")
@@ -1436,11 +1514,15 @@ async def vision_models_api(_=Depends(verify_admin)):
 # ---------- 系统公告（内置） ----------
 BUILTIN_ANNOUNCEMENT = """# 📢 系统公告
 
-## ✨ 最新版本 v1.7.0
+## ✨ 最新版本 v1.7.1
 
-**Lite 压缩、调用日志优化、消耗统计增强等多项改进。**
+**优先积分、路由面板增强等改进。**
 
-### Lite 压缩
+### 优先积分
+- 在路由配置面板中，为每个模型提供 +/- 按钮，手动调节综合路由分
+- 每次点击加减 5%，优先分跟随路由组保存（同名模型可在不同路由组有不同优先分）
+- 优先分保存到 `config.json`，重启不丢失
+- 路由排序时优先分计入综合分，直接影响模型选择
 - 自动去除输入消息中的多余空白、连续换行
 - 缩短 system prompt 中的冗余内容
 - 在不影响语义的前提下减少 token 消耗
