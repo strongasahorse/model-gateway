@@ -2249,7 +2249,7 @@ async def _stream_with_failover(candidates, body, is_router, prelude: str = "", 
                             "duration": round(dur, 2),
                             "tps": round(ct / dur, 2) if dur > 0 and ct > 0 else 0,
                             "input_token_saved": input_saved,
-                            "input_token_saved_pct": round(input_saved / input_orig_chars * 100, 1) if input_orig_chars else 0,
+                            "input_token_saved_pct": round(input_saved / pt * 100, 1) if pt and input_saved else 0,
                         })
                     except Exception:
                         logger.exception("append_usage(stream) failed")
@@ -2348,7 +2348,7 @@ async def proxy_chat(request: Request, force: bool = False):
                         ct = u.get("completion_tokens", 0) or 0
                         tt = pt + ct
                         dur = time.time() - _start_time if '_start_time' in dir() else 0
-                        _saved_pct = round(_input_saved / _input_orig_chars * 100, 1) if _input_orig_chars else 0
+                        _saved_pct = round(_input_saved / pt * 100, 1) if pt and _input_saved else 0
                         await append_usage({
                             "ts": time.time(), "model": model,
                             "provider": provider["name"],
