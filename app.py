@@ -505,10 +505,10 @@ def update_model_quality(key: str, info: dict):
 
 
 def get_quality_score(key: str) -> float:
-    """0~1 可用率，无数据返回 0.5（中性，避免新模型排在已稳定的模型前面）"""
+    """0~1 可用率，无数据返回 1.0（乐观默认：新模型优先试用，避免一次失败长期压制）"""
     q = model_quality.get(key)
     if not q or not q["status_window"]:
-        return 0.5
+        return 1.0
     ok_count = sum(1 for s in q["status_window"] if s == "ok")
     return ok_count / len(q["status_window"])
 
@@ -1267,15 +1267,15 @@ async def get_stability(hours: int = 24, last_n: int = 0, _=Depends(verify_admin
                 if key not in model_stats:
                     model_stats[key] = {"ok": 0, "fail": 0, "error": 0, "total": 0, "latencies": []}
                 model_stats[key]["total"] += 1
-            st = info.get("status", "unknown")
-            if st == "ok":
-                model_stats[key]["ok"] += 1
-                if info.get("latency_ms"):
-                    model_stats[key]["latencies"].append(info["latency_ms"])
-            elif st == "fail":
-                model_stats[key]["fail"] += 1
-            elif st == "error":
-                model_stats[key]["error"] += 1
+                st = info.get("status", "unknown")
+                if st == "ok":
+                    model_stats[key]["ok"] += 1
+                    if info.get("latency_ms"):
+                        model_stats[key]["latencies"].append(info["latency_ms"])
+                elif st == "fail":
+                    model_stats[key]["fail"] += 1
+                elif st == "error":
+                    model_stats[key]["error"] += 1
     allowed = set()
 
     for p in providers:
@@ -1954,7 +1954,7 @@ async def toggle_model(name: str, data: ToggleModelIn, _=Depends(verify_admin)):
     raise HTTPException(404, "未找到")
 
 
-@app.post("/api/check/{name}/{model}")
+@app.post("/api/check/{name}/{model:path}")
 async def manual_check(name: str, model: str, _=Depends(verify_admin)):
 
     for p in providers:
