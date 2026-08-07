@@ -868,16 +868,15 @@ async def poll_all():
             # 如果今日已执行过每日轮询，等明天 work_start
             if _last_daily_poll_date == now.tm_yday:
                 next_day = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, work_start, 0, 0, 0, 0, -1)) + 86400
-                wait_seconds = next_day - time.time()
-                while time.time() < max(time.time() + wait_seconds, last_check_time + interval):
+                logger.info("所有模型轮询已达上限，等待到明天 %d:00 执行每日轮询", work_start)
+                while time.time() < max(next_day, last_check_time + interval):
                     await asyncio.sleep(30)
                 continue
             # 今日尚未执行每日轮询：等 work_start 或立即执行
             daily_time = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, work_start, 0, 0, 0, 0, -1))
             if time.time() < daily_time:
-                wait_seconds = daily_time - time.time()
                 logger.info("所有模型轮询已达 %d 次上限，等待到 %d:00 执行每日轮询", daily_limit, work_start)
-                while time.time() < max(time.time() + wait_seconds, last_check_time + interval):
+                while time.time() < max(daily_time, last_check_time + interval):
                     await asyncio.sleep(30)
             # 执行每日一次轮询（所有模型，不计上限）
             logger.info("执行每日一次轮询")
